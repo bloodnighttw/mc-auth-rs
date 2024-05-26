@@ -7,7 +7,7 @@ use serde_json::Value;
 pub struct TimeSensitiveData<T> where T: TimeSensitiveTrait {
     pub(crate) data: T,
     /// The time when the data was created.
-    #[serde(deserialize_with = "to_time",serialize_with = "to_str")]
+    #[serde(deserialize_with = "str_to_time",serialize_with = "time_to_str")]
     time:DateTime<Local>,
 }
 
@@ -30,18 +30,18 @@ impl<T> TimeSensitiveData<T> where T: TimeSensitiveTrait {
 
 }
 
-fn to_time<'de, D: Deserializer<'de>>(deserializer: D) -> Result<DateTime<Local>, D::Error> {
+fn str_to_time<'de, D: Deserializer<'de>>(deserializer: D) -> Result<DateTime<Local>, D::Error> {
     Ok(match Value::deserialize(deserializer)? {
-        Value::String(num) =>{
-            let t = num.as_str();
+        Value::String(str) =>{
+            let t = str.as_str();
             let datetime = DateTime::parse_from_rfc3339(t).expect("Failed to parse time");
             datetime.with_timezone(&Local)
-        } ,
+        }
         _ => return Err(de::Error::custom("wrong type"))
     })
 }
 
-fn to_str<S>(x: &DateTime<Local>, s: S) -> Result<S::Ok, S::Error>
+fn time_to_str<S>(x: &DateTime<Local>, s: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
 {

@@ -1,15 +1,17 @@
+#![allow(unused)]        // disable all unused warnings...
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use reqwest::{Client, Error, Response};
-use reqwest::header::{CONTENT_TYPE};
+use reqwest::header::{CONTENT_TYPE, PRAGMA};
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{json, Value};
 use thiserror::Error;
-use crate::Data::{TimeSensitiveData, TimeSensitiveTrait};
+use tokio::sync::RwLock;
+use crate::utils::{TimeSensitiveData, TimeSensitiveTrait};
 
 const DEVICECODE_URL:&str = "https://login.microsoftonline.com/consumers/oauth2/v2.0/devicecode";
-const TOKEN_URL:&str = "https://login.microsoftonline.com/common/oauth2/v2.0/token";
+const TOKEN_URL:&str = "https://login.microsoftonline.com/consumers/oauth2/v2.0/token";
 const MINECRAFT_LOGIN_WITH_XBOX: &str = "https://api.minecraftservices.com/authentication/login_with_xbox";
 const XBOX_USER_AUTHENTICATE: &str = "https://user.auth.xboxlive.com/user/authenticate";
 const XBOX_XSTS_AUTHORIZE: &str = "https://xsts.auth.xboxlive.com/xsts/authorize";
@@ -28,16 +30,16 @@ pub enum MinecraftAuthStep{
     /// If the user does not authorize the app within this time, the user code will expire.
     DeviceCode(TimeSensitiveData<DeviceCodeResponse>),
     /// Wait for the user to authorize the app.
-    MicrosoftAuth(Arc<TimeSensitiveData<MicrosoftAuthResponse>>),
+    MicrosoftAuth(Arc<RwLock<TimeSensitiveData<MicrosoftAuthResponse>>>),
 
     /// Exchange the device code for an access token.
     XboxLiveAuth(String),
     /// Exchange the Xbox Live access token for an Xbox Security Token.
     XboxSecurityAuth(String,String),
+    MinecraftAuth(Arc<TimeSensitiveData<MinecraftAuthResponse>>),
     /// Exchange the Xbox Security Token for a Minecraft access token.
     /// Get the user's Minecraft profile to check player have minecraft or not.
-    MinecraftAuth(MinecraftAuthResponse),
-    MinecraftProfile(MinecraftProfile),
+    MinecraftProfile(Arc<MinecraftProfile>),
 }
 
 #[allow(dead_code)]
@@ -56,6 +58,8 @@ pub enum MinecraftAuthError{
     BadVerificationCode,
     #[error("Failed to exchange device code. details: ExpiredToken")]
     ExpiredToken,
+    #[error("Failed to refresh token code. details:{0}")]
+    RefreshMicrosoftTokenError(String),
     #[error("Failed to fetching Xbox Data. details:{0}")]
     XboxAuthError(String),
     #[error("The account doesn't have an Xbox account. Once they sign up for one (or login through minecraft.net to create one) then they can proceed with the login")]
@@ -138,6 +142,12 @@ pub struct MinecraftAuthResponse{
     token_type: String,
 }
 
+impl TimeSensitiveTrait for MinecraftAuthResponse {
+    fn get_duration(&self) -> Duration {
+        self.expires_in
+    }
+}
+
 #[derive(Debug,Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MinecraftSkin {
@@ -190,8 +200,6 @@ impl MinecraftAuthorizationFlow {
         self.status = MinecraftAuthStep::Init();
     }
 
-    ///
-    ///
     pub async fn generate_device_code(&mut self) -> Result<(), MinecraftAuthError>{
         let params:HashMap<String,String> = HashMap::from([
             (String::from("client_id"),self.client_id.clone()),
@@ -254,7 +262,7 @@ impl MinecraftAuthorizationFlow {
             Err(e) => return Err(MinecraftAuthError::UnknownError(e.to_string()))
         };
 
-        self.status = MinecraftAuthStep::MicrosoftAuth(Arc::new(TimeSensitiveData::new(response)));
+        self.status = MinecraftAuthStep::MicrosoftAuth(Arc::new(RwLock::new(TimeSensitiveData::new(response))));
 
         Ok(())
     }
@@ -278,21 +286,73 @@ impl MinecraftAuthorizationFlow {
         Ok(())
     }
 
+    pub async fn refresh_microsoft_token(&mut self) -> Result<(), MinecraftAuthError>{
+        let rw_data = match &self.status{
+            MinecraftAuthStep::MicrosoftAuth(data) => data,
+            _ => return Err(MinecraftAuthError::InvalidState)
+        };
+
+        let refresh_token = {
+            let mut r_data = rw_data.read().await;
+            let params:HashMap<String,String> = HashMap::from([
+                (String::from("client_id"),self.client_id.clone()),
+                (String::from("scope"),String::from(SCOPE)),
+                (String::from("refresh_token"),r_data.data.refresh_token.clone()),
+                (String::from("grant_type"),String::from("refresh_token")),
+            ]);
+
+            let response = self.client.post(TOKEN_URL)
+                .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .form(&params)
+                .header(PRAGMA, "no-cache")
+                .header("Cache-Control", "no-store")
+                .send()
+                .await;
+
+
+            let refresh_token:MicrosoftAuthResponse = match response{
+                Ok(response) => {
+                    if response.status() == 200{
+                        response.json().await.expect("this should be success!")
+                    }else{
+                        println!("{:?}",response.text().await.expect("this should be success!"));
+                        return Err(MinecraftAuthError::RefreshMicrosoftTokenError(format!("Failed to refresh token. status code:{}",400)))
+                    }
+                },
+                Err(e) => return Err(MinecraftAuthError::RefreshMicrosoftTokenError(e.to_string()))
+            };
+
+            refresh_token
+        };
+
+        {
+            let mut r_data = rw_data.write().await;
+            *r_data = TimeSensitiveData::new(refresh_token);
+        }
+
+        Ok(())
+    }
+
     pub async fn xbox_live_auth(&mut self) -> Result<(), MinecraftAuthError>{
         let data = match &self.status{
             MinecraftAuthStep::MicrosoftAuth(data) => data,
             _ => return Err(MinecraftAuthError::InvalidState)
         };
+        
+        let xbox_authenticate_json = {
+            let r_data = data.write().await;
+            let xbox_authenticate_json = json!({
+                "Properties": {
+                    "AuthMethod": "RPS",
+                    "SiteName": "user.auth.xboxlive.com",
+                    "RpsTicket": &format!("d={}", r_data.data.access_token)
+                },
+                "RelyingParty": "http://auth.xboxlive.com",
+                "TokenType": "JWT"
+            });
+            xbox_authenticate_json
+        };
 
-        let xbox_authenticate_json = json!({
-            "Properties": {
-                "AuthMethod": "RPS",
-                "SiteName": "user.auth.xboxlive.com",
-                "RpsTicket": &format!("d={}", data.data.access_token)
-            },
-            "RelyingParty": "http://auth.xboxlive.com",
-            "TokenType": "JWT"
-        });
         let response = self
             .client
             .post(XBOX_USER_AUTHENTICATE)
@@ -393,28 +453,27 @@ impl MinecraftAuthorizationFlow {
             Err(e) => return Err(MinecraftAuthError::UnknownError(e.to_string()))
         };
         
-        self.status = MinecraftAuthStep::MinecraftAuth(res);
+        self.status = MinecraftAuthStep::MinecraftAuth(Arc::new(TimeSensitiveData::new(res)));
         
         Ok(())
     }
     
-    pub async fn check_minecraft_profile(&mut self) -> Result<(),MinecraftAuthError>{
-        
-        let data = match &self.status{
+    pub async fn check_minecraft_profile(&mut self) -> Result<(),MinecraftAuthError> {
+        let data = match &self.status {
             MinecraftAuthStep::MinecraftAuth(data) => data,
             _ => return Err(MinecraftAuthError::InvalidState)
         };
-        
+
         let response = self.client.get(MINECRAFT_PROFILE)
-            .bearer_auth(data.access_token.clone())
+            .bearer_auth(data.data.access_token.clone())
             .send()
             .await;
-        
+
         let profile_data = match response {
             Ok(response) => {
-                if response.status() == 200{
+                if response.status() == 200 {
                     response.json::<MinecraftProfile>().await.expect("this should be success!")
-                }else{
+                } else {
                     return Err(MinecraftAuthError::ProfileNotFound(response.text().await.expect("this should be success!")))
                 }
             },
@@ -422,10 +481,9 @@ impl MinecraftAuthorizationFlow {
                 return Err(MinecraftAuthError::UnknownError(e.to_string()))
             }
         };
-        
-        self.status = MinecraftAuthStep::MinecraftProfile(profile_data);
-        
+
+        self.status = MinecraftAuthStep::MinecraftProfile(Arc::from(profile_data));
+
         Ok(())
     }
-    
 }
